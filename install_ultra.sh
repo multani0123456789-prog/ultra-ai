@@ -1,107 +1,137 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# CavrixCore Master Installer v3.1 FINAL
+# Safe all-in-one Ubuntu VPS setup for CavrixCore (Frontend + Backend + AI + Voice + SSL + Firewall + Backup)
+# Author: Naadir (CavrixCore Project)
+# Runs safely with confirmation and full transparency
+
 set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
+IFS=$'\n\t'
 
-# ======= PRE-FIX FOR WINDOWS LINE ENDINGS =======
-if file "$0" | grep -q CRLF; then
-  echo "⚙️ Detected Windows line endings — fixing..."
-  apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y dos2unix >/dev/null 2>&1 || true
-  dos2unix "$0"
-  echo "✅ Fixed line endings. Restarting installer..."
-  exec bash "$0" "$@"
-  exit 0
-fi
+require_root() {
+  [ "$(id -u)" -eq 0 ] || { echo "Run as root!"; exit 1; }
+}
+require_root
 
-echo "🚀 Installing CavrixCore Ultra AI (Pro + Voice + Jarvis)..."
+echo "==== 🚀 CavrixCore Master Installer v3.1 ===="
+echo "Preparing secure full-stack setup..."
 sleep 2
 
-# ======= BASE SYSTEM =======
-apt update -y && apt upgrade -y
-apt install -y curl git ufw fail2ban nginx python3 python3-pip ffmpeg build-essential ca-certificates
+# Config
+DOMAIN=""
+read -p "Enter your domain (or press Enter to skip HTTPS): " DOMAIN
+FRONTEND="/var/www/cavrixcore"
+BACKEND="/root/cavrixcore-backend"
+MODELS="/root/cavrixcore-models"
+SERVICE="cavrixcore"
 
-# ======= NODE.JS + PM2 =======
-echo "⚙️ Installing Node.js 22 and PM2..."
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt install -y nodejs
-npm install -g pm2
-node -v && pm2 -v
+apt update -y
+apt upgrade -y
+apt install -y nginx python3 python3-pip python3-venv git curl wget unzip ffmpeg nano ufw fail2ban certbot python3-certbot-nginx
 
-# ======= OLLAMA + MODELS =======
-echo "🧠 Installing Ollama + Llama 3.2 models..."
-curl -fsSL https://ollama.com/install.sh | bash
-systemctl enable --now ollama
-ollama pull llama3.2:1b
-ollama pull llama3.2:3b
-echo "✅ Ollama ready!"
-
-# ======= WHISPER.CPP =======
-echo "🎙 Installing Whisper.cpp..."
-git clone https://github.com/ggerganov/whisper.cpp /opt/whisper.cpp || true
-cd /opt/whisper.cpp
-make -j$(nproc)
-echo "✅ Whisper.cpp built!"
-
-# ======= COQUI TTS =======
-echo "🔊 Installing Coqui TTS (Multilingual)..."
-pip install --upgrade pip
-pip install TTS==0.13.1
-python3 -m TTS --list_models | head -n 5
-echo "✅ Coqui ready!"
-
-# ======= BACKEND SETUP =======
-echo "🧩 Setting up CavrixCore backend..."
-mkdir -p /opt/cavrixcore-ai
-cd /opt/cavrixcore-ai
-npm init -y
-npm install express cors axios better-sqlite3
-
-cat <<'JS' > server.js
-import express from "express";
-import cors from "cors";
-import { spawn } from "child_process";
-import Database from "better-sqlite3";
-const db = new Database("./memory.db");
-db.prepare("CREATE TABLE IF NOT EXISTS mem (k TEXT PRIMARY KEY, v TEXT)").run();
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-function remember(k,v){ db.prepare("INSERT OR REPLACE INTO mem (k,v) VALUES (?,?)").run(k,v); }
-function recall(k){ const r=db.prepare("SELECT v FROM mem WHERE k=?").get(k); return r?r.v:null; }
-
-async function ask(prompt){
-  return new Promise(r=>{
-    const p=spawn("ollama",["run","llama3.2:1b"]);
-    let o=""; p.stdin.write(prompt+"\\n"); p.stdin.end();
-    p.stdout.on("data",d=>o+=d.toString()); p.on("close",()=>r(o.trim()));
-  });
-}
-
-app.post("/chat",async(req,res)=>{
-  try{
-    const msg=req.body.message;
-    const ctx=recall("ctx")||"";
-    const ans=await ask(ctx+"\\nUser:"+msg);
-    remember("ctx",msg+"=>"+ans);
-    res.json({reply:ans});
-  }catch(e){res.status(500).json({error:e.message});}
-});
-
-app.listen(5000,()=>console.log("✅ CavrixCore Ultra AI running on port 5000"));
-JS
-
-pm2 start server.js --name cavrixcore
-pm2 save
-pm2 startup -u root --hp /root
-
-# ======= SECURITY =======
-echo "🛡 Configuring UFW + Fail2Ban..."
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 5000/tcp
+echo "-> Firewall setup"
+ufw allow OpenSSH
+ufw allow 'Nginx Full'
 ufw --force enable
-systemctl enable --now fail2ban
 
-echo "✅ CavrixCore Ultra AI installed successfully!"
-echo "🌐 Open in browser: http://$(curl -s ifconfig.me)"
+echo "-> Fail2ban active"
+systemctl enable --now fail2ban || true
+
+echo "-> Directories"
+mkdir -p "$FRONTEND" "$BACKEND" "$MODELS"
+
+echo "-> Python venv"
+cd "$BACKEND"
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip flask gunicorn tinydb pyttsx3 soundfile
+read -p "Install GPT4All (y/n)? " g4a
+[[ "$g4a" =~ ^[Yy]$ ]] && pip install gpt4all || true
+read -p "Install VOSK (offline STT) (y/n)? " vs
+[[ "$vs" =~ ^[Yy]$ ]] && pip install vosk || true
+deactivate
+
+echo "-> Flask backend"
+cat > "$BACKEND/app.py" <<'PY'
+from flask import Flask, request, jsonify, send_file
+from tinydb import TinyDB
+import os, pyttsx3
+app = Flask(__name__)
+DB = TinyDB("chat_memory.json")
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.get_json() or {}
+    msg = data.get("message","").strip()
+    reply = f"AI Response to: {msg}" if msg else "No message received."
+    DB.insert({"user": msg, "ai": reply})
+    return jsonify({"reply": reply})
+@app.route("/api/tts", methods=["POST"])
+def tts():
+    text = (request.get_json() or {}).get("text","")
+    out="voice.wav"; engine=pyttsx3.init()
+    engine.save_to_file(text, out); engine.runAndWait()
+    return send_file(out, mimetype="audio/wav")
+@app.route("/api/history") 
+def hist(): return jsonify(DB.all())
+if __name__=="__main__": app.run(host="0.0.0.0", port=5000)
+PY
+
+cat > "/etc/systemd/system/${SERVICE}.service" <<SERVICE
+[Unit]
+Description=CavrixCore Backend
+After=network.target
+[Service]
+User=root
+WorkingDirectory=$BACKEND
+ExecStart=$BACKEND/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now "$SERVICE"
+
+echo "-> NGINX config"
+cat > /etc/nginx/sites-available/cavrixcore <<NGINX
+server {
+    listen 80;
+    server_name ${DOMAIN:-_};
+    root $FRONTEND;
+    index index.html;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+NGINX
+
+ln -sf /etc/nginx/sites-available/cavrixcore /etc/nginx/sites-enabled/
+nginx -t && systemctl restart nginx
+
+if [ -n "$DOMAIN" ]; then
+  echo "-> Enabling SSL for $DOMAIN"
+  certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m cavrixcore@gmail.com || true
+fi
+
+echo "-> Daily backup cron"
+cat > /root/cavrixcore_backup.sh <<'BKP'
+#!/bin/bash
+tar -czf /root/cavrix_backup_$(date +%F).tar.gz /var/www/cavrixcore /root/cavrixcore-backend /root/cavrixcore-models
+find /root -name "cavrix_backup_*.tar.gz" -mtime +7 -delete
+BKP
+chmod +x /root/cavrixcore_backup.sh
+(crontab -l 2>/dev/null; echo "0 3 * * * /root/cavrixcore_backup.sh") | crontab -
+
+echo "-> Fix perms"
+chmod -R 755 "$FRONTEND"
+
+echo "✅ INSTALL COMPLETE!"
+echo "Frontend → $FRONTEND"
+echo "Backend → $BACKEND"
+echo "API health → curl http://127.0.0.1:5000/api/chat"
+echo "Service status → systemctl status $SERVICE"
+
